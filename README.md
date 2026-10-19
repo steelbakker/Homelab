@@ -455,3 +455,206 @@ The current deployment is operational, but additional projects remain:
 - Continue documenting architectural decisions and configuration changes.
 
 **Project status — October 2026:** Core Twingate migration, active Minecraft Java hosting, automated off-site backups, certificate renewal, and principal host firewall hardening completed and tested.
+
+---
+
+## Project Journal
+
+<details>
+<summary><strong>2026-10-18 — AATool tracking, Minecraft compatibility fixes, and Swivel</strong></summary>
+
+# Minecraft Achievement Tracking, Third-Person Camera, and Recovery Notes
+
+> **Documentation privacy:** Hostnames, private IP addresses, server identifiers, usernames, and UUIDs in this document are examples or placeholders, not values from the actual deployment. The `192.168.50.0/24` network is illustrative. Replace placeholders with locally verified values when running commands. Do not commit passwords, API keys, OAuth credentials, or SFTP credentials to GitHub.
+
+## 1. Project Context
+
+This journal update covers AATool SFTP tracking, the Minecraft 26.3 directory-layout workaround, and recent client-side mod observations.
+
+## 2. Problem: AATool Could Connect but Could Not Track Progress
+
+AATool's remote tracking mode uses SFTP to read Minecraft's saved advancements and statistics. The Pterodactyl Wings SFTP endpoint accepted credentials on TCP port `2022`, and Windows OpenSSH could browse the server's files.
+
+However, AATool initially reported SFTP errors, showed **0 completed advancements**, or retried continuously. Wings journal entries identified the failing paths:
+
+```text
+error while listing directory error=openat2 advancements: file does not exist
+error while listing directory error=openat2 stats: file does not exist
+```
+
+The root cause was a layout difference between the paths expected by this AATool release and the actual Minecraft 26.3 player-data directories:
+
+| Purpose | Legacy path expected by AATool | Actual path in Minecraft 26.3 |
+|---|---|---|
+| Advancements | `world/advancements/` | `world/players/advancements/` |
+| Statistics | `world/stats/` | `world/players/stats/` |
+
+
+## 3. Troubleshooting and Diagnosis
+
+The failure was isolated in stages:
+
+1. Tested reachability from Windows using `Test-NetConnection <NODE_IP> -Port 2022`; TCP connectivity succeeded.
+2. Authenticated with Windows OpenSSH SFTP using the per-server Pterodactyl SFTP username; authentication succeeded.
+3. Listed the world directory and confirmed that legacy `world/advancements/` did not exist.
+4. Verified JSON files under `world/players/advancements/` and `world/players/stats/`.
+5. Matched the chosen Minecraft player against `usercache.json`.
+6. Inspected the player's advancement JSON, confirming standard entries with `criteria` and `"done": true`.
+7. Consulted `journalctl -u wings` to determine which directory AATool requested during retries.
+
+Recipe unlocks appear in the JSON but are not counted as normal AATool advancements.
+
+### Why a symbolic link was not sufficient
+
+An initial relative symbolic link, `world/advancements -> players/advancements`, could be followed by Linux on the node but **could not be listed through Wings SFTP**. This was verified using Windows OpenSSH SFTP.
+
+The symbolic link was removed before applying an alternative. Wings filesystem protections were not disabled.
+
+## 4. Solution: Bind Mount Compatibility Directories
+
+Linux bind mounts were used to expose the existing player-data directories at the legacy paths without moving the source files:
+
+```text
+Minecraft world/
+├── advancements/              [bind mount] → players/advancements/
+├── stats/                     [bind mount] → players/stats/
+└── players/
+    ├── advancements/          [actual JSON data]
+    └── stats/                 [actual JSON data]
+```
+
+For an example deployment, the node-side commands are:
+
+```bash
+WORLD=/var/lib/pterodactyl/volumes/<SERVER_UUID>/world
+
+# Only after confirming these source folders and checking the target paths.
+sudo test -d "$WORLD/players/advancements"
+sudo test -d "$WORLD/players/stats"
+
+# The compatibility target directories must not contain independent data.
+sudo mkdir -p "$WORLD/advancements" "$WORLD/stats"
+
+sudo mount --bind "$WORLD/players/advancements" "$WORLD/advancements"
+sudo mount --bind "$WORLD/players/stats" "$WORLD/stats"
+```
+
+**Safety:** Do not run these commands on an arbitrary world. If a target is already mounted or contains real files, inspect it before proceeding. Bind mounts do not duplicate JSON data, but writing through either path affects the same underlying files.
+
+Both legacy paths were successfully listed through Pterodactyl Wings SFTP after mounting:
+
+```text
+sftp> ls world/advancements
+sftp> ls world/stats
+```
+
+## 5. Persistence with systemd Mount Units
+
+Temporary bind mounts disappear after a reboot. Two systemd `.mount` units were created and enabled on the **Wings node VM**, one for each compatibility path.
+
+Unit names were generated with `systemd-escape`:
+
+```bash
+WORLD=/var/lib/pterodactyl/volumes/<SERVER_UUID>/world
+
+for DIR in advancements stats; do
+    SOURCE="$WORLD/players/$DIR"
+    TARGET="$WORLD/$DIR"
+    UNIT=$(systemd-escape --path --suffix=mount "$TARGET")
+
+    sudo tee "/etc/systemd/system/$UNIT" >/dev/null <<EOF
+[Unit]
+Description=Minecraft AATool $DIR compatibility bind mount
+RequiresMountsFor=$SOURCE
+
+[Mount]
+What=$SOURCE
+Where=$TARGET
+Type=none
+Options=bind
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+done
+
+sudo systemctl daemon-reload
+
+for DIR in advancements stats; do
+    UNIT=$(systemd-escape --path --suffix=mount "$WORLD/$DIR")
+    sudo systemctl enable --now "$UNIT"
+done
+```
+
+### Validation
+
+The verification commands were:
+
+```bash
+WORLD=/var/lib/pterodactyl/volumes/<SERVER_UUID>/world
+
+for DIR in advancements stats; do
+    UNIT=$(systemd-escape --path --suffix=mount "$WORLD/$DIR")
+    echo "=== $DIR ==="
+    systemctl is-enabled "$UNIT"
+    systemctl is-active "$UNIT"
+    findmnt -M "$WORLD/$DIR"
+done
+```
+
+Both units reported **`enabled`** and **`active`**, with `findmnt` confirming the correct source directories. The Wings node VM was then rebooted independently of the Proxmox host, Panel VM, and reverse proxy. Both mount units remained enabled and active after the reboot.
+
+
+## 6. AATool Client Configuration and Result
+
+The working Windows configuration was:
+
+| Setting | Configuration |
+|---|---|
+| Application | CTM's AATool 1.8.0.1 |
+| Tracking mode | Remote (SFTP) |
+| Hostname | `<NODE_LAN_IP>` |
+| Port | `2022` |
+| Credentials | Pterodactyl per-server SFTP username and authorized password |
+| Custom Server Path | Blank (SFTP root) |
+| Server Type | Linux |
+| Player Filtering | Solo |
+| Player identifier | Matching Minecraft username |
+| Game Version | 1.21.6 advancement set selected for tracking |
+
+AATool reported **`Synced!`** and showed **13 / 124 advancements** in Solo mode after initially working in Combined mode.
+
+**Compatibility limitation:** AATool 1.8.0.1 uses the **1.21.6** advancement catalog, so tracking works but newer **26.3** advancements may be missing.
+
+## 7. Backup and Recovery Notes
+
+The existing `backup.py` uses the Pterodactyl Client API to back up the **server files** (world, player data, mods, and configuration), then uploads the archive to Google Drive with `rclone`. It handles graceful shutdown/restart, archive verification, retention, and Discord notifications. The retention policy is already documented in the main infrastructure overview and is unchanged.
+
+The backup does **not** capture the Wings VM or its systemd mount units. Those units must be recreated when restoring onto a replacement node. A complete Google Drive restore has not yet been tested.
+
+**Follow-up:** Inspect a new backup archive to determine whether the two bind-mounted compatibility folders create duplicate entries. This has not yet been verified.
+
+## 8. Client-Side Minecraft Mod: Swivel
+
+Multiple players are now successfully using [Swivel](https://www.curseforge.com/minecraft/mc-mods/swivel) through **CurseForge on their own clients** (`swivel-neoforge-1.2.0+mc26.3.jar`, Minecraft **26.3**, NeoForge **26.3.0.77**). **It is not installed on the Pterodactyl server.** Server-side installation may be explored later if supported.
+
+The goal is to accommodate a player who experiences motion sickness almost immediately in Minecraft's first-person view by offering more comfortable third-person camera controls. **Early results have been promising**, and the affected player have been able to play using the mod.
+
+The Pterodactyl console has also repeatedly logged the following for more than one player:
+
+```text
+Player <username> standing on air - force-sending blocks below
+```
+
+Swivel is one suspected cause, but **this has not been tested or confirmed**. The messages remain unexplained.
+
+## 9. Lessons and Next Steps
+
+Wings logs identified missing directories despite successful SFTP authentication. Bind mounts provided backward-compatible paths without weakening SFTP protections; systemd made them reboot-persistent.
+
+Remaining work: verify AATool after major version updates, inspect backup archives for duplicate mount content, perform a Google Drive restore test, and retain the systemd unit definitions for node recovery.
+
+**Result:** AATool Solo tracking works through Pterodactyl SFTP, and both compatibility mounts remained active after rebooting the Wings node VM.
+
+</details>
